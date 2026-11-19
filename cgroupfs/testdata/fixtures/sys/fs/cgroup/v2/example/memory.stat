@@ -1,0 +1,5 @@
+file 4096
+anon 8192
+swap 2048
+oom 3
+oom_kill 2
