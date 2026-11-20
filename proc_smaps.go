@@ -18,12 +18,32 @@ package procfs
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/prometheus/procfs/internal/parsers"
+)
+
+var (
+	// ErrProcSMapsIncomplete is returned when an smaps or smaps_rollup file
+	// could not be read in full, typically because the process exited while
+	// the file was being read. The kernel may signal this with a read error
+	// (e.g. ESRCH) or by ending the seq_file iteration early with a clean EOF.
+	// In the latter case the file ends without the trailer the kernel always
+	// emits for a complete snapshot, so the missing tail must not be parsed as
+	// zero-valued metrics.
+	ErrProcSMapsIncomplete = errors.New("incomplete smaps read, the process likely exited while the file was being read")
+
+	// smapsRollupTrailer is the last metric line the kernel emits in
+	// /proc/[pid]/smaps_rollup. A complete snapshot always ends with it.
+	smapsRollupTrailer = "Locked"
+
+	// smapsBlockTrailerPrefix is the first field of the last line of every
+	// VMA block in /proc/[pid]/smaps. A complete block always ends with it.
+	smapsBlockTrailerPrefix = "VmFlags"
 )
 
 // Match the header line before each mapped zone in `/proc/pid/smaps`.
@@ -63,6 +83,10 @@ func (p Proc) ProcSMapsRollup() (ProcSMapsRollup, error) {
 		return p.procSMapsRollupManual()
 	}
 	if err != nil {
+		return ProcSMapsRollup{}, fmt.Errorf("%w: %w", ErrFileRead, err)
+	}
+
+	if err := validateProcSMapsRollupData(data); err != nil {
 		return ProcSMapsRollup{}, err
 	}
 
@@ -84,6 +108,29 @@ func (p Proc) ProcSMapsRollup() (ProcSMapsRollup, error) {
 	return smaps, nil
 }
 
+// validateProcSMapsRollupData rejects snapshots that were cut short. The
+// kernel emits a fixed trailer ("Locked:") as the last non-empty line of a
+// complete smaps_rollup; when the process disappears mid-read the seq_file
+// iteration can stop earlier with a clean EOF, leaving no trailer behind.
+//
+// This only inspects bytes already held in memory: it adds no I/O and does
+// not read the file a second time, so the cost of the normal path is
+// unchanged.
+func validateProcSMapsRollupData(data []byte) error {
+	trimmed := strings.TrimRight(string(data), "\n\t ")
+	if trimmed == "" {
+		return fmt.Errorf("%w: %s", ErrProcSMapsIncomplete, "smaps_rollup is empty")
+	}
+	lastLine := trimmed
+	if idx := strings.LastIndexByte(trimmed, '\n'); idx >= 0 {
+		lastLine = trimmed[idx+1:]
+	}
+	if field, _, ok := strings.Cut(lastLine, ":"); ok && field == smapsRollupTrailer {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrProcSMapsIncomplete, "smaps_rollup is missing its trailer")
+}
+
 // Read /proc/pid/smaps and do the roll-up in Go code.
 func (p Proc) procSMapsRollupManual() (ProcSMapsRollup, error) {
 	file, err := os.Open(p.path("smaps"))
@@ -94,17 +141,39 @@ func (p Proc) procSMapsRollupManual() (ProcSMapsRollup, error) {
 
 	smaps := ProcSMapsRollup{}
 	scan := bufio.NewScanner(file)
+	// Every VMA block in smaps ends with a VmFlags line. While scanning,
+	// blockComplete says the last block seen so far has its trailer; a new
+	// header starts a block that must end with VmFlags before EOF.
+	blockComplete := true
 
 	for scan.Scan() {
 		line := scan.Text()
+		if line == "" {
+			continue
+		}
 
 		if procSMapsHeaderLine.MatchString(line) {
+			if !blockComplete {
+				return ProcSMapsRollup{}, fmt.Errorf("%w: %s", ErrProcSMapsIncomplete, "smaps VMA block is missing its VmFlags trailer")
+			}
+			blockComplete = false
 			continue
+		}
+
+		if field, _, ok := strings.Cut(line, ":"); ok && field == smapsBlockTrailerPrefix {
+			blockComplete = true
 		}
 
 		if err := smaps.parseLine(line); err != nil {
 			return ProcSMapsRollup{}, err
 		}
+	}
+
+	if err := scan.Err(); err != nil {
+		return ProcSMapsRollup{}, fmt.Errorf("%w: %w", ErrFileRead, err)
+	}
+	if !blockComplete {
+		return ProcSMapsRollup{}, fmt.Errorf("%w: %s", ErrProcSMapsIncomplete, "smaps ended in the middle of a VMA block")
 	}
 
 	return smaps, nil
