@@ -14,10 +14,15 @@
 package procfs
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -43,6 +48,190 @@ func TestAllThreads(t *testing.T) {
 		if diff := cmp.Diff(wantFS, haveFS); diff != "" {
 			t.Fatalf("unexpected diff (-want +got):\n%s", diff)
 		}
+	}
+}
+
+func TestThreadCount(t *testing.T) {
+	fixFS := getProcFixtures(t)
+
+	count, err := fixFS.ThreadCount(testPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, have := len(testTIDS), count; want != have {
+		t.Errorf("want thread count %d, have %d", want, have)
+	}
+
+	threads, err := fixFS.AllThreads(testPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, have := len(threads), count; want != have {
+		t.Errorf("thread count %d disagrees with %d threads listed by AllThreads", have, want)
+	}
+}
+
+func TestThreadCounter(t *testing.T) {
+	root := t.TempDir()
+	taskDir := filepath.Join(root, "1234", "task")
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tid := range []string{"1234", "1235"} {
+		if err := os.Mkdir(filepath.Join(taskDir, tid), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	fs, err := NewFS(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	c := NewThreadCounter(fs, time.Minute)
+	c.now = func() time.Time { return now }
+
+	count, err := c.Count(1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, have := 2, count; want != have {
+		t.Fatalf("want thread count %d, have %d", want, have)
+	}
+
+	// A new thread appears, but within the refresh interval the cached
+	// value is returned.
+	if err := os.Mkdir(filepath.Join(taskDir, "1236"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	count, err = c.Count(1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, have := 2, count; want != have {
+		t.Fatalf("want cached thread count %d, have %d", want, have)
+	}
+
+	// After the interval has passed the directory is re-scanned.
+	now = now.Add(2 * time.Minute)
+	count, err = c.Count(1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, have := 3, count; want != have {
+		t.Fatalf("want refreshed thread count %d, have %d", want, have)
+	}
+
+	// Errors are not cached: a process that appears later is counted.
+	if _, err := c.Count(5678); err == nil {
+		t.Fatal("want error for non-existing process")
+	}
+	if err := os.MkdirAll(filepath.Join(root, "5678", "task", "5678"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	count, err = c.Count(5678)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want, have := 1, count; want != have {
+		t.Fatalf("want thread count %d, have %d", want, have)
+	}
+}
+
+// TestThreadCountVsStatNumThreads compares the two thread-count sources on a
+// live process while threads are created and destroyed in rapid succession:
+// ProcStat.NumThreads, the num_threads field of /proc/self/stat, and
+// FS.ThreadCount, the number of entries in /proc/self/task. The two are read
+// from different kernel data and are not refreshed atomically, so they may
+// briefly disagree while threads come and go; once the churn stops they must
+// converge.
+func TestThreadCountVsStatNumThreads(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live /proc test in short mode")
+	}
+
+	fs, err := NewDefaultFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := fs.Self()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Churn OS threads: a goroutine exiting while locked to its thread
+	// destroys the thread.
+	const workers = 8
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				done := make(chan struct{})
+				go func() {
+					runtime.LockOSThread()
+					close(done)
+				}()
+				<-done
+			}
+		}()
+	}
+
+	// Sample both sources during the churn and record how far apart they
+	// drift. Require -v flag to see the per-sample values.
+	counter := NewThreadCounter(fs, 10*time.Millisecond)
+	maxDelta := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		stat, err := self.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		count, err := counter.Count(self.PID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		delta := stat.NumThreads - count
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta > maxDelta {
+			maxDelta = delta
+		}
+		t.Logf("churning: stat.NumThreads %d, task entries %d, delta %d", stat.NumThreads, count, delta)
+	}
+	close(stop)
+	wg.Wait()
+	t.Logf("max delta between stat.NumThreads and task entries while churning: %d", maxDelta)
+
+	// Once the churn has stopped, both sources must converge on the same
+	// value. Poll to ride out unrelated runtime thread activity.
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		stat, err := self.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		count, err := fs.ThreadCount(self.PID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stat.NumThreads == count {
+			t.Logf("converged: stat.NumThreads %d, task entries %d", stat.NumThreads, count)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("thread counts did not converge: stat.NumThreads %d, task entries %d", stat.NumThreads, count)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
